@@ -15,17 +15,17 @@ end-to-end on this data.
 
 ## What this is
 
-| Service | Image | Port | Job |
+| Service | Image | Public port | Job |
 |---|---|---|---|
-| `osm` | `overv/openstreetmap-tile-server:2.3.0` | `0.0.0.0:8080` | raster PNG tiles |
-| `nominatim` | `mediagis/nominatim:5.1-2025-07-29T07-58` | `0.0.0.0:8088` | forward + reverse geocoding |
-| `osrm` | `ghcr.io/project-osrm/osrm-backend:v5.27.1` | `0.0.0.0:5000` | car routing (MLD) |
+| `gateway` | `nginx:1.27-alpine` | `8080`, `8088`, `5000` | access control + rate limiting |
+| `osm` | `overv/openstreetmap-tile-server:2.3.0` | loopback `8081` | raster PNG tiles |
+| `nominatim` | `mediagis/nominatim:5.1-2025-07-29T07-58` | loopback `8090` | forward + reverse geocoding |
+| `osrm` | `ghcr.io/project-osrm/osrm-backend:v5.27.1` | loopback `5001` | car routing (MLD) |
 | `osm-import` | tile-server image | — | one-off PostGIS import |
 | `osrm-prepare` | OSRM image | — | one-off graph build |
 
-Tiles are public (browsers load them directly). Nominatim and OSRM are bound to
-loopback — see [Network exposure](#network-exposure) before using them from a
-browser.
+Everything the internet can reach is behind the gateway, which requires a
+shared key — see [Access control](#access-control).
 
 ---
 
@@ -49,8 +49,9 @@ cd iran-osm-stack
 curl -fL -o iran-latest.osm.pbf https://download.geofabrik.de/asia/iran-latest.osm.pbf
 curl -fL -o iran.poly           https://download.geofabrik.de/asia/iran.poly
 
-# 2. A password for the Nominatim database role (see warning below)
-echo "NOMINATIM_PASSWORD=$(openssl rand -hex 16)" > .env
+# 2. Two secrets: the Nominatim DB password and the gateway access key
+printf 'NOMINATIM_PASSWORD=%s\n' "$(openssl rand -hex 16)" > .env
+echo "OSM_ACCESS_KEY=$(openssl rand -hex 32)" >> .env
 chmod 600 .env
 
 # 3. Import everything and start serving
@@ -124,28 +125,37 @@ gone, requiring a full re-import. `docker compose down` (without `-v`) is safe.
 
 ## Verify it works
 
+All requests need the key:
+
 ```bash
+KEY=$(grep OSM_ACCESS_KEY .env | cut -d= -f2)
+
 # Tile for central Tehran (z12) — expect HTTP 200
 curl -o /dev/null -w '%{http_code}\n' \
-  http://127.0.0.1:8080/tile/12/2632/1614.png
+  "http://127.0.0.1:8080/k/$KEY/tile/12/2632/1614.png"
 
 # CORS header, needed for cross-origin tile loading
-curl -sI http://127.0.0.1:8080/tile/12/2632/1614.png | grep -i access-control
+curl -sI "http://127.0.0.1:8080/k/$KEY/tile/12/2632/1614.png" \
+  | grep -i access-control
 # → Access-Control-Allow-Origin: *
 
 # Geocoder health
-curl http://127.0.0.1:8088/status
+curl "http://127.0.0.1:8088/k/$KEY/status"
 # → OK
 
 # Forward geocoding, Persian script
-curl "http://127.0.0.1:8088/search?q=$(python3 -c 'import urllib.parse;print(urllib.parse.quote("تهران"))')&format=json&limit=1"
+curl "http://127.0.0.1:8088/k/$KEY/search?q=$(python3 -c 'import urllib.parse;print(urllib.parse.quote("تهران"))')&format=json&limit=1"
 
 # Reverse geocoding, central Tehran
-curl "http://127.0.0.1:8088/reverse?lat=36.558188&lon=48.716125&format=json"
+curl "http://127.0.0.1:8088/k/$KEY/reverse?lat=36.558188&lon=48.716125&format=json"
 
 # Routing — expect {"code":"Ok",...}
-curl "http://127.0.0.1:5000/route/v1/driving/48.716125,36.558188;48.730000,36.570000?overview=false"
+curl "http://127.0.0.1:5000/k/$KEY/route/v1/driving/48.716125,36.558188;48.730000,36.570000?overview=false"
 ```
+
+Without a key each of those returns `403` — that is the gateway working, not a
+failure. Note that the geocoder answers `429` if you send requests faster than
+1/second; that is the rate limit doing its job.
 
 On a successful import of the Iran extract the tile database holds roughly:
 **822k points · 2.4M lines · 219k roads · 897k polygons**.
@@ -154,58 +164,116 @@ On a successful import of the Iran extract the tile database holds roughly:
 
 ## Connecting h-dashboard
 
-In the h-dashboard `.env`:
+See [Access control](#access-control) for the full `.env` block. In short:
 
 ```dotenv
-TILE_SERVER_SCHEME=http
-TILE_SERVER_IP=<this-host>
-TILE_SERVER_PORT=8080
-TILE_URL_TEMPLATE=http://<this-host>:8080/tile/{z}/{x}/{y}.png
+TILE_URL_TEMPLATE=http://<host>:8080/tile/{z}/{x}/{y}.png?key=<KEY>
+GEOCODING_SERVER_URL=http://<host>:8088?key=<KEY>
+ROUTING_SERVER_URL=http://<host>:5000?key=<KEY>
 ```
-
-Then read [Network exposure](#network-exposure) before enabling search and
-routing.
 
 ---
 
-## Network exposure
+## Access control
 
-All three services bind to `0.0.0.0` and are reachable from any host that can
-route to this machine.
+An nginx gateway owns all three public ports. The tile server, geocoder and
+router are bound to `127.0.0.1` and cannot be reached at all except through it.
 
-| Port | Service | Purpose |
-|---|---|---|
-| `8080` | tiles | loaded by every browser |
-| `8088` | Nominatim | search + reverse geocoding |
-| `5000` | OSRM | routing |
+```
+Internet ──▶ gateway :8080 / :8088 / :5000   (requires ?key=…)
+                          │
+                          ├─▶ osm        127.0.0.1:8081
+                          ├─▶ nominatim  127.0.0.1:8090
+                          └─▶ osrm       127.0.0.1:5001
+```
 
-**Why not loopback:** h-dashboard calls Nominatim and OSRM directly from browser
-JavaScript (`resources/views/livewire/maps/route2.blade.php` does
-`axios.get()` against the geocoding URL and points Leaflet-Routing at the
-routing URL). `127.0.0.1` inside a browser resolves to **the user's own
-machine**, so a loopback binding would leave search and routing working only on
-the server itself. Bind to a routable address instead.
+The gateway does two things:
+
+1. **Requires `?key=<OSM_ACCESS_KEY>`** on every tile, geocoding and routing
+   request. Without it: `403`.
+2. **Rate-limits the geocoder to 1 req/s**, which is exactly
+   [Nominatim's usage-policy ceiling](https://operations.osmfoundation.org/policies/nominatim/),
+   and sets an identifying `User-Agent`. Tiles get 20 req/s (a single map view
+   legitimately requests dozens) and routing 5 req/s.
+
+### Generate the key
+
+```bash
+echo "OSM_ACCESS_KEY=$(openssl rand -hex 32)" >> .env
+```
+
+Rotating it later is instant and needs no re-import — it affects only the
+gateway.
+
+### Point h-dashboard at it
+
+`config/map.php` composes only `{scheme}://{ip}:{port}` and then appends its own
+path (`/search`, `/route/v1`), so the key cannot ride in a query string and
+there is no env var for a full URL. The gateway therefore also accepts the key
+as a **path prefix**, which works with map.php unchanged.
 
 ```dotenv
-GEOCODING_SERVER_IP=<this-host>
+TILE_URL_TEMPLATE=http://<host>:8080/k/<KEY>/tile/{z}/{x}/{y}.png
+
+GEOCODING_SERVER_SCHEME=http
+GEOCODING_SERVER_IP=<host>
 GEOCODING_SERVER_PORT=8088
-ROUTING_SERVER_IP=<this-host>
+# map.php builds http://<host>:8088/search → point it at the key prefix instead
+```
+
+For geocoding and routing, set the base to the key prefix. Since map.php has no
+variable for that, either prefix it in the host value (works because the key is
+path-safe) or set the two URLs directly in the views:
+
+```dotenv
+# these produce:  http://<host>:8088/k/<KEY>/search
+#             and http://<host>:5000/k/<KEY>/route/v1
+GEOCODING_SERVER_IP=<host>
+GEOCODING_SERVER_PORT=8088
+ROUTING_SERVER_IP=<host>
 ROUTING_SERVER_PORT=5000
 ```
 
-### ⚠ Rate-limit Nominatim before real traffic
+Verify:
 
-This is the cost of a public bind, and it is not optional in good conscience.
-[Nominatim's usage policy](https://operations.osmfoundation.org/policies/nominatim/)
-allows an **absolute maximum of 1 request per second** and requires an
-identifying `User-Agent`. The `mediagis/nominatim` image sends no `User-Agent`
-and enforces no rate limit of its own.
+```bash
+KEY=$(grep OSM_ACCESS_KEY .env | cut -d= -f2)
 
-Unthrottled, one page load per user is enough to get the server
-blocked. Put a reverse proxy in front of `:8088` that caps at 1 req/s, adds a
-`User-Agent`, and restricts by IP or key. OSRM has no equivalent policy, but
-`--algorithm mld` will happily consume all available RAM under load, so cap it
-too.
+# no key → 403
+curl -o /dev/null -w '%{http_code}\n' "http://<host>:8080/tile/12/2632/1614.png"
+
+# wrong key → 403
+curl -o /dev/null -w '%{http_code}\n' "http://<host>:8080/k/deadbeef/tile/12/2632/1614.png"
+
+# correct key → 200
+curl -o /dev/null -w '%{http_code}\n' "http://<host>:8080/k/$KEY/tile/12/2632/1614.png"
+
+# query form works too
+curl -o /dev/null -w '%{http_code}\n' "http://<host>:8080/tile/12/2632/1614.png?key=$KEY"
+
+# rate limit engages after the burst allowance
+for i in $(seq 1 8); do
+  curl -s -o /dev/null -w '%{http_code} ' "http://<host>:8088/k/$KEY/status"
+done
+# → 200 200 200 200 200 200 429 429
+```
+
+### Why the key travels in the URL
+
+Tiles are loaded by `<img src>`, and a browser cannot attach a custom header to
+an image request. A header-based scheme would leave the map blank.
+
+### What this does and does not protect you against
+
+**It does** stop unauthenticated use, port scanning, and a casual load on
+Nominatim that would get you blocked under its usage policy.
+
+**It does not** stop a determined user. The key is embedded in page HTML and
+lands in browser history and proxy logs, so any authenticated user of
+h-dashboard can read it and call the endpoints directly. That is acceptable
+when the users are your own staff; if you need a hard boundary, proxy the three
+endpoints through h-dashboard's authenticated session instead of exposing them,
+and drop the gateway entirely.
 
 ### Attribution
 

@@ -55,25 +55,35 @@
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # NETWORK EXPOSURE
-#   Tiles      0.0.0.0:8080 — public, this is what browsers load.
-#   Nominatim  0.0.0.0:8088 — public. See the rate-limit warning below.
-#   OSRM       0.0.0.0:5000 — public.
+#   Nothing is exposed directly. A single nginx gateway owns all three public
+#   ports and every backend below is bound to 127.0.0.1, so osm / nominatim /
+#   osrm are unreachable except through the gateway.
 #
-# These are bound to all interfaces because h-dashboard calls Nominatim and
-# OSRM directly from BROWSER JavaScript (route2.blade.php does axios.get() on
-# the geocoding URL and points Leaflet-Routing at the routing URL).
-# "127.0.0.1" inside a browser resolves to the USER's machine, so a loopback
-# binding would leave search and routing working only on the server itself.
+#     gateway  8080 (tiles) · 8088 (geocoding) · 5000 (routing)
+#     backends 127.0.0.1 only
 #
-# ⚠ Nominatim's usage policy caps at 1 req/s and requires an identifying
-#   User-Agent. This image sends no User-Agent and enforces no rate limit.
-#   Put a rate-limiting reverse proxy in front of :8088 before real traffic,
-#   or you will get the server blocked.
+# The gateway requires ?key=<OSM_ACCESS_KEY> on EVERY request and rate-limits
+# the geocoder to 1 req/s. Nominatim's usage policy allows exactly that maximum
+# and requires an identifying User-Agent, which the mediagis image sends
+# neither of.
+#
+# ⚠ The key must be in the URL, not a header: tiles are loaded by <img src>,
+#   and a browser cannot attach a header to an image request. Leaflet-Routing
+#   builds its URL as serviceUrl + "/driving/<coords>?...", so putting the key
+#   inside serviceUrl works for it too:
+#       ROUTING_SERVER_IP=<host>
+#       ROUTING_SERVER_PORT=5000   → serviceUrl = http://<host>:5000?key=…
+#   ⚠ A URL-embedded secret is visible in page source to any user who can see
+#     the page. This stops accidental use and casual scanning, not a motivated
+#     user. For a hard guarantee, proxy through h-dashboard's authenticated
+#     session instead of exposing the backends at all.
 #
 #   h-dashboard .env:
-#     TILE_URL_TEMPLATE=http://<host>:8080/tile/{z}/{x}/{y}.png
+#     TILE_URL_TEMPLATE=http://<host>:8080/tile/{z}/{x}/{y}.png?key=<KEY>
 #     GEOCODING_SERVER_IP=<host>  GEOCODING_SERVER_PORT=8088
+#     GEOCODING_URL=http://<host>:8088?key=<KEY>     (config/map.php appends /search)
 #     ROUTING_SERVER_IP=<host>    ROUTING_SERVER_PORT=5000
+#     ROUTING_URL=http://<host>:5000?key=<KEY>       (config/map.php appends /route/v1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Import + render threads. Host has 4 cores; do not exceed nproc or the
@@ -162,12 +172,9 @@ services:
       osrm-prepare:
         condition: service_completed_successfully
     ports:
-      # Bound to all interfaces: browsers on the LAN reach the geocoder
-      # directly, and "127.0.0.1" inside a browser means the USER's machine.
-      # ⚠ Nominatim's usage policy allows an absolute maximum of 1 request per
-      # second and wants an identifying User-Agent. This image sends neither,
-      # so put a rate-limiting reverse proxy in front before real traffic.
-      - "0.0.0.0:8088:8080"
+      # Loopback only. Note the host port differs from the gateway's public one:
+      # the gateway binds 8088 publicly, so the backend moves to 8090 internally.
+      - "127.0.0.1:8090:8080"
     environment:
       PBF_PATH: /osm-data/iran-latest.osm.pbf
       REPLICATION_URL: "https://download.geofabrik.de/asia/iran-updates/"
@@ -211,7 +218,8 @@ services:
       osm-import:
         condition: service_completed_successfully
     ports:
-      - "8080:80"
+      # Loopback only; gateway owns 8080 publicly, backend moves to 8081.
+      - "127.0.0.1:8081:80"
     environment:
       THREADS: *threads
       # Leaflet pages are served from another origin (e.g. h-dashboard), so the
@@ -245,9 +253,8 @@ services:
       osrm-prepare:
         condition: service_completed_successfully
     ports:
-      # Bound to all interfaces: Leaflet-Routing fetches from the browser too, so a
-      # loopback binding would only be reachable from the server itself.
-      - "0.0.0.0:5000:5000"
+      # Loopback only; gateway owns 5000 publicly, backend moves to 5001.
+      - "127.0.0.1:5001:5000"
     entrypoint: ["sh", "-c"]
     # Fail loudly instead of crash-looping if the graph is missing.
     # NOTE: osrm-extract does NOT create a bare `iran-latest.osrm` header file,
@@ -270,6 +277,40 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+    logging: *default-logging
+
+# ── Access gateway: the only service bound to 0.0.0.0 ─────────────────────
+  # Requires ?key=<OSM_ACCESS_KEY> on every request and rate-limits the
+  # geocoder to 1 req/s, which is exactly Nominatim's usage-policy ceiling.
+  # Backends above are on 127.0.0.1, so this is the only ingress.
+  gateway:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      osm:
+        condition: service_started
+      nominatim:
+        condition: service_started
+      osrm:
+        condition: service_started
+    ports:
+      - "8080:8080"
+      - "8088:8088"
+      - "5000:5000"
+    environment:
+      # Generated once into .env on first run. If absent, generate and persist.
+      OSM_ACCESS_KEY: "${OSM_ACCESS_KEY:?set OSM_ACCESS_KEY in .env — see README}"
+    volumes:
+      - ./gateway/nginx.conf.template:/etc/nginx/templates/gateway.conf.template:ro
+      - ./gateway/entrypoint.sh:/docker-entrypoint-gateway.sh:ro
+    entrypoint: ["/bin/sh", "/docker-entrypoint-gateway.sh"]
+    healthcheck:
+      # Hits the gateway's own unauthenticated probe.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     logging: *default-logging
 
 volumes:

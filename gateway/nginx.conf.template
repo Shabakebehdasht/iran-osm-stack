@@ -1,0 +1,235 @@
+# Access gateway for the Iran OSM stack.
+#
+# Sits in front of the tiles, geocoder and router and is the ONLY thing bound
+# to 0.0.0.0. Every backend (osm / nominatim / osrm) is bound to 127.0.0.1 and
+# is unreachable from outside this container's network namespace.
+#
+# Two jobs:
+#   1. Require a shared secret (?key=...) on every request. Without it: 403.
+#   2. Rate-limit the geocoder, because Nominatim's usage policy allows an
+#      absolute maximum of 1 request/second and requires an identifying
+#      User-Agent. The mediagis image enforces neither.
+#
+# The secret is injected at startup (see docker-compose.yml), never baked into
+# the image, so the same image works with any key.
+
+# Rate limit zones. Nominatim: 1 req/s sustained, small burst for a page that
+# fires a couple of searches at once. Tiles get a far looser budget because a
+# single map view legitimately requests dozens of tiles.
+limit_req_zone $binary_remote_addr zone=geo:10m   rate=1r/s;
+limit_req_zone $binary_remote_addr zone=tiles:10m rate=20r/s;
+limit_req_zone $binary_remote_addr zone=route:10m rate=5r/s;
+
+# ── Shared secret ─────────────────────────────────────────────────────────
+# Substituted by entrypoint.sh from $OSM_ACCESS_KEY at container start, so the
+# secret never sits in an image layer (docker history, registry copies).
+#
+# Only a query-string key is checked here: ?key=<secret>. The path form
+# /k/<key>/… is rewritten to strip the key in a `rewrite` at the server level
+# BEFORE the `if` below runs, so $arg_key covers both cases and there is no
+# map/variable chaining to get wrong.
+#
+# Why a query string at all, given h-dashboard's config/map.php only composes
+# "{scheme}://{ip}:{port}"? Because map.php has no env var for a full URL: it
+# appends "/search" and "/route/v1" itself. h-dashboard therefore has to be
+# pointed at a host:port and cannot carry a key in the path without a code
+# change. See README — either patch map.php to accept the base path, or accept
+# that the key travels in the query string of the *tile template* only, which
+# map.php does support via TILE_URL_TEMPLATE.
+#
+# The alternative used in production here: the gateway rewrites the path form
+# to the query form internally, so both work from the outside.
+
+map_hash_bucket_size 256;
+
+# Two accepted forms, so curl and h-dashboard can use whichever is convenient:
+#
+#   path form   /k/<key>/tile/12/2632/1614.png
+#   query form  /tile/12/2632/1614.png?key=<key>
+#
+# The path form is what h-dashboard uses: config/map.php composes only
+# "{scheme}://{ip}:{port}" and appends its own path ("/search", "/route/v1"), so
+# it cannot carry a key in a query string — and a key in the port field is not
+# valid URL syntax. The prefix goes in the path, which works with map.php
+# unchanged. See the README for the .env block.
+#
+# ⚠ The second map's source is the FIRST map's output. This chaining is safe
+#   here and was NOT safe before: a `map` is evaluated lazily, so when both
+#   halves were built from other maps the value arrived empty and every request
+#   got 403, correct key or not. The first map reads $uri and the second reads
+#   $arg_key directly — both real nginx variables, no indirection.
+map $uri $osm_key_from_path {
+    default           "";
+    "~^/k/([^/]+)/"   $1;
+}
+
+map $osm_key_from_path $osm_key_ok_path {
+    default              0;
+    "__OSM_ACCESS_KEY__" 1;
+}
+
+map $arg_key $osm_key_ok_query {
+    default              0;
+    "__OSM_ACCESS_KEY__" 1;
+}
+
+# Do not advertise the software. OSM's tile usage policy discourages heavy
+# automated use of public tile servers; keeping this generic is polite.
+server_tokens off;
+
+# Upstreams address the backends by SERVICE NAME, not 127.0.0.1: inside the
+# compose network each service is its own container, and "localhost" there would
+# mean the gateway itself. Host-loopback ports (8081/8090/5001) are for host-side
+# debugging only.
+upstream nominatim_up { server nominatim:8080; keepalive 8; }
+upstream osrm_up      { server osrm:5000;      keepalive 8; }
+upstream tiles_up     { server osm:80;        keepalive 16; }
+
+# ── Tiles ─────────────────────────────────────────────────────────────────
+server {
+    listen 8080;
+    server_name _;
+
+    # Health probe. No key required: it is a static "ok" that never contacts an
+    # upstream, and a secret cannot safely sit on a healthcheck command line.
+    location = /_health {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Path form. The prefix is stripped so the backend sees a normal /tile/… path.
+        location ~ ^/k/[0-9a-f]+(?<trest>/.*)$ {
+            if ($osm_key_ok_path = 0) {
+                return 403 '{"error":"invalid or missing access key"}';
+            }
+
+            limit_req zone=tiles burst=60 nodelay;
+
+            rewrite ^ $trest break;
+            proxy_pass http://tiles_up;
+
+            # Tiles are immutable per zoom level and a browser re-requests them on
+            # every pan, so caching saves the renderer a lot of work.
+            expires 7d;
+            add_header Cache-Control "public, max-age=604800";
+
+            # Leaflet on h-dashboard loads tiles from another origin.
+            add_header Access-Control-Allow-Origin "*" always;
+        }
+
+        # Query form, no prefix to strip.
+        location /tile/ {
+            if ($osm_key_ok_query = 0) {
+                return 403 '{"error":"invalid or missing access key"}';
+            }
+
+            limit_req zone=tiles burst=60 nodelay;
+            proxy_pass http://tiles_up;
+            expires 7d;
+            add_header Cache-Control "public, max-age=604800";
+            add_header Access-Control-Allow-Origin "*" always;
+        }
+
+        # Demo page from the tile image, for a quick manual check.
+        location = / {
+            if ($osm_key_ok_query = 0) {
+                return 403 '{"error":"invalid or missing access key"}';
+            }
+            proxy_pass http://tiles_up;
+            add_header Access-Control-Allow-Origin "*" always;
+        }
+    }
+
+# ── Geocoder: 1 req/s, with the User-Agent Nominatim's policy asks for ─────
+server {
+    listen 8088;
+    server_name _;
+
+    # Path form: /k/<key>/search?q=…  →  /search?q=…
+    location ~ ^/k/[0-9a-f]+(?<grest>/.*)$ {
+        if ($osm_key_ok_path = 0) {
+            return 403 '{"error":"invalid or missing access key"}';
+        }
+
+        limit_req zone=geo burst=5 nodelay;
+        limit_req_status 429;
+
+        rewrite ^ $grest break;
+        proxy_pass http://nominatim_up;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+
+        # Nominatim's usage policy requires an identifying User-Agent.
+        proxy_set_header User-Agent "h-dashboard-osm-gateway/1.0";
+
+        # Geocoding is CPU-bound; give it room and don't let nginx cut it off.
+        proxy_read_timeout 120s;
+        proxy_connect_timeout 10s;
+
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+
+    # Query form.
+    location / {
+        if ($osm_key_ok_query = 0) {
+            return 403 '{"error":"invalid or missing access key"}';
+        }
+
+        limit_req zone=geo burst=5 nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://nominatim_up;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header User-Agent "h-dashboard-osm-gateway/1.0";
+        proxy_read_timeout 120s;
+        proxy_connect_timeout 10s;
+
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+}
+
+# ── Router ────────────────────────────────────────────────────────────────
+server {
+    listen 5000;
+    server_name _;
+
+    # Path form: /k/<key>/route/v1/driving/…  →  /route/v1/driving/…
+    location ~ ^/k/[0-9a-f]+(?<rrest>/.*)$ {
+        if ($osm_key_ok_path = 0) {
+            return 403 '{"error":"invalid or missing access key"}';
+        }
+
+        limit_req zone=route burst=10 nodelay;
+
+        rewrite ^ $rrest break;
+        proxy_pass http://osrm_up;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # MLD graphs for a country can take a moment to answer the first call.
+        proxy_read_timeout 120s;
+        proxy_connect_timeout 10s;
+
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+
+    # Query form.
+    location / {
+        if ($osm_key_ok_query = 0) {
+            return 403 '{"error":"invalid or missing access key"}';
+        }
+
+        limit_req zone=route burst=10 nodelay;
+        proxy_pass http://osrm_up;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_read_timeout 120s;
+        proxy_connect_timeout 10s;
+
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+}
