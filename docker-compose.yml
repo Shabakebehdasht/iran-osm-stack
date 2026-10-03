@@ -55,27 +55,25 @@
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # NETWORK EXPOSURE
-#   Tiles      0.0.0.0:8080  — public, this is what browsers load.
-#   Nominatim  127.0.0.1:8088 — loopback only.
-#   OSRM       127.0.0.1:5000 — loopback only.
+#   Tiles      0.0.0.0:8080 — public, this is what browsers load.
+#   Nominatim  0.0.0.0:8088 — public. See the rate-limit warning below.
+#   OSRM       0.0.0.0:5000 — public.
 #
-# ⚠ h-dashboard calls Nominatim and OSRM directly from BROWSER JavaScript
-#   (route2.blade.php does axios.get() on the geocoding URL and points
-#   Leaflet-Routing at the routing URL). "127.0.0.1" inside a browser means the
-#   USER's machine, not this server — so with the default .env values
-#   (GEOCODING_SERVER_IP / ROUTING_SERVER_IP = 127.0.0.1) geocoding and routing
-#   fail in every browser except your own.
-#   To make them work, pick ONE:
-#     (a) bind those two ports to 0.0.0.0 AND put a rate-limiting reverse
-#         proxy in front — Nominatim's usage policy caps at 1 req/s and wants
-#         an identifying User-Agent, which this image does not send; or
-#     (b) terminate both behind your existing web server and set the .env
-#         values to that hostname.
-#   Loopback below is the SAFE default. Choose deliberately.
+# These are bound to all interfaces because h-dashboard calls Nominatim and
+# OSRM directly from BROWSER JavaScript (route2.blade.php does axios.get() on
+# the geocoding URL and points Leaflet-Routing at the routing URL).
+# "127.0.0.1" inside a browser resolves to the USER's machine, so a loopback
+# binding would leave search and routing working only on the server itself.
+#
+# ⚠ Nominatim's usage policy caps at 1 req/s and requires an identifying
+#   User-Agent. This image sends no User-Agent and enforces no rate limit.
+#   Put a rate-limiting reverse proxy in front of :8088 before real traffic,
+#   or you will get the server blocked.
 #
 #   h-dashboard .env:
 #     TILE_URL_TEMPLATE=http://<host>:8080/tile/{z}/{x}/{y}.png
-#     GEOCODING_SERVER_IP / ROUTING_SERVER_IP = <reachable host, if (a) or (b)>
+#     GEOCODING_SERVER_IP=<host>  GEOCODING_SERVER_PORT=8088
+#     ROUTING_SERVER_IP=<host>    ROUTING_SERVER_PORT=5000
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Import + render threads. Host has 4 cores; do not exceed nproc or the
@@ -164,7 +162,12 @@ services:
       osrm-prepare:
         condition: service_completed_successfully
     ports:
-      - "127.0.0.1:8088:8080"
+      # Bound to all interfaces: browsers on the LAN reach the geocoder
+      # directly, and "127.0.0.1" inside a browser means the USER's machine.
+      # ⚠ Nominatim's usage policy allows an absolute maximum of 1 request per
+      # second and wants an identifying User-Agent. This image sends neither,
+      # so put a rate-limiting reverse proxy in front before real traffic.
+      - "0.0.0.0:8088:8080"
     environment:
       PBF_PATH: /osm-data/iran-latest.osm.pbf
       REPLICATION_URL: "https://download.geofabrik.de/asia/iran-updates/"
@@ -242,7 +245,9 @@ services:
       osrm-prepare:
         condition: service_completed_successfully
     ports:
-      - "127.0.0.1:5000:5000"
+      # Bound to all interfaces: Leaflet-Routing fetches from the browser too, so a
+      # loopback binding would only be reachable from the server itself.
+      - "0.0.0.0:5000:5000"
     entrypoint: ["sh", "-c"]
     # Fail loudly instead of crash-looping if the graph is missing.
     # NOTE: osrm-extract does NOT create a bare `iran-latest.osrm` header file,

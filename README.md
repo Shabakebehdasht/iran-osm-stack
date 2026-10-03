@@ -18,8 +18,8 @@ end-to-end on this data.
 | Service | Image | Port | Job |
 |---|---|---|---|
 | `osm` | `overv/openstreetmap-tile-server:2.3.0` | `0.0.0.0:8080` | raster PNG tiles |
-| `nominatim` | `mediagis/nominatim:5.1-2025-07-29T07-58` | `127.0.0.1:8088` | forward + reverse geocoding |
-| `osrm` | `ghcr.io/project-osrm/osrm-backend:v5.27.1` | `127.0.0.1:5000` | car routing (MLD) |
+| `nominatim` | `mediagis/nominatim:5.1-2025-07-29T07-58` | `0.0.0.0:8088` | forward + reverse geocoding |
+| `osrm` | `ghcr.io/project-osrm/osrm-backend:v5.27.1` | `0.0.0.0:5000` | car routing (MLD) |
 | `osm-import` | tile-server image | — | one-off PostGIS import |
 | `osrm-prepare` | OSRM image | — | one-off graph build |
 
@@ -170,30 +170,42 @@ routing.
 
 ## Network exposure
 
-Tiles are public. Nominatim and OSRM are bound to `127.0.0.1` on purpose.
+All three services bind to `0.0.0.0` and are reachable from any host that can
+route to this machine.
 
-**h-dashboard calls Nominatim and OSRM directly from browser JavaScript**
-(`resources/views/livewire/maps/route2.blade.php` does `axios.get()` against
-the geocoding URL and points Leaflet-Routing at the routing URL). `127.0.0.1`
-inside a browser resolves to **the user's own machine**, not this server. So
-with the default values
+| Port | Service | Purpose |
+|---|---|---|
+| `8080` | tiles | loaded by every browser |
+| `8088` | Nominatim | search + reverse geocoding |
+| `5000` | OSRM | routing |
+
+**Why not loopback:** h-dashboard calls Nominatim and OSRM directly from browser
+JavaScript (`resources/views/livewire/maps/route2.blade.php` does
+`axios.get()` against the geocoding URL and points Leaflet-Routing at the
+routing URL). `127.0.0.1` inside a browser resolves to **the user's own
+machine**, so a loopback binding would leave search and routing working only on
+the server itself. Bind to a routable address instead.
 
 ```dotenv
-GEOCODING_SERVER_IP=127.0.0.1
-ROUTING_SERVER_IP=127.0.0.1
+GEOCODING_SERVER_IP=<this-host>
+GEOCODING_SERVER_PORT=8088
+ROUTING_SERVER_IP=<this-host>
+ROUTING_SERVER_PORT=5000
 ```
 
-geocoding and routing fail in every browser except your own. To enable them,
-pick one:
+### ⚠ Rate-limit Nominatim before real traffic
 
-- **(a)** Bind those two ports to `0.0.0.0` **and** put a rate-limiting reverse
-  proxy in front. Nominatim's usage policy requires an absolute maximum of
-  1 request/second and an identifying `User-Agent`; this image sends neither.
-- **(b)** Terminate both behind your existing web server or reverse proxy on
-  this host, and set the `.env` values to that hostname.
+This is the cost of a public bind, and it is not optional in good conscience.
+[Nominatim's usage policy](https://operations.osmfoundation.org/policies/nominatim/)
+allows an **absolute maximum of 1 request per second** and requires an
+identifying `User-Agent`. The `mediagis/nominatim` image sends no `User-Agent`
+and enforces no rate limit of its own.
 
-Loopback is the safe default. Choose deliberately — do not just expose the
-ports.
+Unthrottled, one page load per user is enough to get the server
+blocked. Put a reverse proxy in front of `:8088` that caps at 1 req/s, adds a
+`User-Agent`, and restricts by IP or key. OSRM has no equivalent policy, but
+`--algorithm mld` will happily consume all available RAM under load, so cap it
+too.
 
 ### Attribution
 
