@@ -1,0 +1,273 @@
+# One-shot self-hosted OpenStreetMap stack for Iran — tiles + geocoding + routing
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN IT ONCE. That is the whole point of this file:
+#
+#     docker compose up -d
+#
+# It imports the PBF into the tile database, builds the OSRM graph, imports
+# Nominatim, and starts all three services — in that order, automatically.
+#
+# Re-running `up` is SAFE. Every import step checks a completion marker first
+# and exits 0 immediately if the work is already done, so a restart or a
+# redeploy never re-imports and never destroys your data.
+#
+# FIRST RUN TIMING (Iran, 229MB PBF, ~4 cores / 15GB RAM):
+#     tile import     ~10 min
+#     OSRM graph      ~10 min
+#     Nominatim       ~45 min   (longest step by far)
+#   Watch it:  docker compose logs -f nominatim
+#   Healthy when:  docker compose ps   → all three show (healthy)
+#
+# Disk needed: ~25GB total (tile DB 10GB + Nominatim 9GB + OSRM 2.4GB).
+# Memory needed: 15GB RAM, 4 cores. Lower THREADS if you have less.
+#
+# ⚠ Do NOT run the imports in parallel — they thrash RAM/CPU and will OOM.
+#   The depends_on chain below enforces the order for you.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# FILES THIS NEEDS (all paths relative to this file):
+#   iran-latest.osm.pbf   https://download.geofabrik.de/asia/iran-latest.osm.pbf
+#   iran.poly             https://download.geofabrik.de/asia/iran.poly
+#   .env                  must contain NOMINATIM_PASSWORD=...
+#
+#   curl -fL -o iran-latest.osm.pbf https://download.geofabrik.de/asia/iran-latest.osm.pbf
+#   curl -fL -o iran.poly       https://download.geofabrik.de/asia/iran.poly
+#   echo "NOMINATIM_PASSWORD=$(openssl rand -hex 16)" > .env && chmod 600 .env
+#
+# ⚠ KEEP THE DIRECTORY NAME. Docker derives volume names from it
+#   (folder "osm-stack" → volume "osm-stack_osm-data"). Renaming the folder
+#   orphans your data and triggers a fresh multi-hour import.
+#
+# ⚠ NEVER CHANGE NOMINATIM_PASSWORD after the first run. The database role is
+#   created with it during import; changing it breaks Nominatim's connection.
+#   .env is chmod 600 and contains a real secret — keep it out of git.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA UPDATES
+#   Tiles    automatic  (UPDATES=enabled + REPLICATION_URL + iran.poly)
+#   Geocoding automatic (UPDATE_MODE=continuous + REPLICATION_URL)
+#   Routing  NOT automatic — OSRM has no replication. To refresh: download a
+#            new PBF, delete the graph, re-run this file:
+#              sudo rm -f osrm-data/iran-latest.osrm*
+#              docker compose up -d
+#   `docker compose down -v` DESTROYS ALL imported data. Never run it casually.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# NETWORK EXPOSURE
+#   Tiles      0.0.0.0:8080  — public, this is what browsers load.
+#   Nominatim  127.0.0.1:8088 — loopback only.
+#   OSRM       127.0.0.1:5000 — loopback only.
+#
+# ⚠ h-dashboard calls Nominatim and OSRM directly from BROWSER JavaScript
+#   (route2.blade.php does axios.get() on the geocoding URL and points
+#   Leaflet-Routing at the routing URL). "127.0.0.1" inside a browser means the
+#   USER's machine, not this server — so with the default .env values
+#   (GEOCODING_SERVER_IP / ROUTING_SERVER_IP = 127.0.0.1) geocoding and routing
+#   fail in every browser except your own.
+#   To make them work, pick ONE:
+#     (a) bind those two ports to 0.0.0.0 AND put a rate-limiting reverse
+#         proxy in front — Nominatim's usage policy caps at 1 req/s and wants
+#         an identifying User-Agent, which this image does not send; or
+#     (b) terminate both behind your existing web server and set the .env
+#         values to that hostname.
+#   Loopback below is the SAFE default. Choose deliberately.
+#
+#   h-dashboard .env:
+#     TILE_URL_TEMPLATE=http://<host>:8080/tile/{z}/{x}/{y}.png
+#     GEOCODING_SERVER_IP / ROUTING_SERVER_IP = <reachable host, if (a) or (b)>
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Import + render threads. Host has 4 cores; do not exceed nproc or the
+# import thrashes. Lower this if the host has less RAM.
+x-threads: &threads "${THREADS:-4}"
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ── STEP 1: import the PBF into the tile server's PostGIS ──────────────────
+  # Runs automatically on `up`. Exits 0 at once if already imported.
+  osm-import:
+    image: overv/openstreetmap-tile-server:2.3.0
+    restart: "no"
+    shm_size: 1gb
+    # The image's entrypoint is /run.sh, which requires exactly one argument.
+    # We override it so we can check the marker before delegating to it.
+    entrypoint: ["sh", "-c"]
+    # MUST stay a single-element list. A folded `>` scalar gets split by Compose
+    # into multiple argv entries, and `sh -c` would then run only the first
+    # word — which is how a "successful" import once built nothing at all.
+    command:
+      - >-
+        if [ -f /data/database/planet-import-complete ]; then
+          echo "Tile database already imported — skipping. To force a re-import, delete the osm-data volume.";
+          exit 0;
+        fi;
+        echo "Importing $(du -h /data/region.osm.pbf | cut -f1) into PostGIS (takes ~10 min)...";
+        /run.sh import
+    environment:
+      THREADS: *threads
+    volumes:
+      - osm-data:/data/database
+      - osm-tiles:/data/tiles
+      - ./iran-latest.osm.pbf:/data/region.osm.pbf:ro
+      # region.poly is REQUIRED: UPDATES=enabled silently does nothing without
+      # it, because osmosis cannot know which region the diff files apply to.
+      - ./iran.poly:/data/region.poly:ro
+    logging: *default-logging
+
+  # ── STEP 2: build the OSRM routing graph ──────────────────────────────────
+  # Runs automatically after step 1. Exits 0 at once if the graph exists.
+  osrm-prepare:
+    # Docker Hub's osrm/osrm-backend is frozen at v5.25 (2021); the project
+    # publishes current images on GHCR. Pinned so a later `pull` can never pair
+    # a new osrm-routed with a graph built by a different version.
+    image: ghcr.io/project-osrm/osrm-backend:v5.27.1
+    restart: "no"
+    depends_on:
+      osm-import:
+        condition: service_completed_successfully
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        if [ -f /data/iran-latest.osrm.fileIndex ]; then
+          echo "OSRM graph already built — skipping. To force a rebuild, delete osrm-data/iran-latest.osrm*";
+          exit 0;
+        fi;
+        echo "Building OSRM graph (takes ~10 min)...";
+        osrm-extract -p /opt/car.lua /data/iran-latest.osm.pbf &&
+        osrm-partition /data/iran-latest.osrm &&
+        osrm-customize /data/iran-latest.osrm
+    volumes:
+      - ./osrm-data:/data
+      - ./iran-latest.osm.pbf:/data/iran-latest.osm.pbf:ro
+    logging: *default-logging
+
+  # ── STEP 3: Nominatim geocoding (imports itself on first start) ───────────
+  nominatim:
+    image: mediagis/nominatim:5.1-2025-07-29T07-58
+    # NOT "unless-stopped". start.sh skips the import only when the marker
+    # /var/lib/postgresql/16/main/import-finished exists, and that marker is
+    # written AFTER the import succeeds. With unless-stopped, any import
+    # failure (disk full, bad PBF) re-runs the ENTIRE import in a tight loop —
+    # enough to fill the disk and wedge the host. on-failure:3 gives it a few
+    # tries, then stops so the logs can actually be read.
+    restart: on-failure:3
+    shm_size: 2g
+    # Serialised after the OSRM graph so the two RAM-heavy imports never
+    # overlap. This is what keeps a 15GB host from OOMing.
+    depends_on:
+      osrm-prepare:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8088:8080"
+    environment:
+      PBF_PATH: /osm-data/iran-latest.osm.pbf
+      REPLICATION_URL: "https://download.geofabrik.de/asia/iran-updates/"
+      # REPLICATION_URL alone does nothing — updates default to "none"
+      UPDATE_MODE: continuous
+      THREADS: *threads
+      # No weak fallback: an unset password must stop the import, not silently
+      # create a database role with a publicly known default.
+      NOMINATIM_PASSWORD: "${NOMINATIM_PASSWORD:?set NOMINATIM_PASSWORD in .env before the first run}"
+    volumes:
+      # The PBF MUST NOT live under /nominatim. init.sh runs
+      #   chown -R nominatim:nominatim ${PROJECT_DIR}   (PROJECT_DIR=/nominatim)
+      # unconditionally, and on a read-only bind mount that chown fails with
+      # "Read-only file system" — the container exits 1 and crash-loops forever
+      # before the import ever starts.
+      - ./iran-latest.osm.pbf:/osm-data/iran-latest.osm.pbf:ro
+      # mediagis/nominatim 5.1 runs PostgreSQL 16 — this path must say 16
+      - nominatim-data:/var/lib/postgresql/16/main
+      # NO flatnode volume. config.sh turns on NOMINATIM_FLATNODE_FILE purely by
+      # testing `if [ -d /nominatim/flatnode ]`, and mounting a volume there
+      # creates exactly that directory. Nominatim's docs put flatnode at "at
+      # least 75GB of free space" for planet-sized imports; on this 229MB Iran
+      # extract it wrote a 63GB flatnode.file and filled a 145GB disk. Without
+      # the mount, nodes live in the database instead.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The first start IS the import and it is slow. start_period only
+      # suppresses failure counting; an unhealthy container is not restarted.
+      start_period: 30m
+    logging: *default-logging
+
+  # ── Tile server (serving only; never imports) ─────────────────────────────
+  osm:
+    image: overv/openstreetmap-tile-server:2.3.0
+    restart: unless-stopped
+    shm_size: 1gb
+    depends_on:
+      osm-import:
+        condition: service_completed_successfully
+    ports:
+      - "8080:80"
+    environment:
+      THREADS: *threads
+      # Leaflet pages are served from another origin (e.g. h-dashboard), so the
+      # tile responses need Access-Control-Allow-Origin.
+      ALLOW_CORS: enabled
+      UPDATES: enabled
+      REPLICATION_URL: "https://download.geofabrik.de/asia/iran-updates/"
+      MAX_INTERVAL_SECONDS: "900"
+      EXPIRY_MINZOOM: "13"
+      EXPIRY_TOUCHFROM: "13"
+      EXPIRY_DELETEFROM: "19"
+      EXPIRY_MAXZOOM: "20"
+    volumes:
+      - osm-data:/data/database
+      - osm-tiles:/data/tiles
+    command: run
+    healthcheck:
+      # wget exists in this image; curl does not.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
+
+  # ── OSRM routing (serving only) ───────────────────────────────────────────
+  osrm:
+    image: ghcr.io/project-osrm/osrm-backend:v5.27.1
+    restart: unless-stopped
+    depends_on:
+      osrm-prepare:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:5000:5000"
+    entrypoint: ["sh", "-c"]
+    # Fail loudly instead of crash-looping if the graph is missing.
+    # NOTE: osrm-extract does NOT create a bare `iran-latest.osrm` header file,
+    # only the `iran-latest.osrm.*` companions, and osrm-routed starts fine
+    # from the prefix. So test the fileIndex companion, not the prefix.
+    command:
+      - >-
+        if [ ! -f /data/iran-latest.osrm.fileIndex ]; then
+          echo "OSRM graph missing. Run: docker compose up -d" >&2;
+          exit 1;
+        fi;
+        exec osrm-routed --algorithm mld /data/iran-latest.osrm
+    volumes:
+      # Only the prepared .osrm.* graph files — the PBF is not needed here.
+      - ./osrm-data:/data
+    healthcheck:
+      # this image has bash, so /dev/tcp works; no wget/curl guaranteed
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5000"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+
+volumes:
+  osm-data:
+  osm-tiles:
+  nominatim-data:

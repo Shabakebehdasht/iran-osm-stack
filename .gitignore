@@ -1,0 +1,31 @@
+# The OSM extract — 220MB, downloaded by the user (see README)
+iran-latest.osm.pbf
+*.pbf
+
+# Generated: Nominatim flatnode storage (this stack does not use it, but a
+# volume mount or a manual run can still create it) — 63GB on the Iran extract
+flatnode/
+*.flatnode.file
+
+# Generated: OSRM graph output — 2.4GB, rebuilt by osrm-prepare
+osrm-data/
+*.osrm
+*.osrm.*
+
+# Generated: downloaded polygon (committed on purpose — see below)
+# iran.poly is intentionally NOT ignored: it is only 9KB and the stack
+# cannot enable tile updates without it.
+
+# Secrets — NEVER commit. The Nominatim DB role is created with this password
+# during import and changing it later breaks the connection.
+.env
+.env.*
+!.env.example
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
