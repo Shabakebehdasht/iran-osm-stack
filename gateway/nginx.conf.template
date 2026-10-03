@@ -73,6 +73,33 @@ map $arg_key $osm_key_ok_query {
     "__OSM_ACCESS_KEY__" 1;
 }
 
+# ── Local Network Access (LNA) ────────────────────────────────────────────
+# Chrome 130+ requires an explicit opt-in before a page may fetch a *more
+# private* network than the one it came from. h-dashboard served from a public
+# hostname reaching a LAN/private gateway IP (or 127.0.0.1) is exactly that
+# case, so the browser sends a preflight carrying
+# Access-Control-Request-Private-Network / -Local-Network and REJECTS the
+# response unless the server answers
+# Access-Control-Allow-Private-Network / -Local-Network: true.
+#
+# Without these the symptom is deceptive: <img> tiles keep loading, because an
+# <img> is a no-CORS request that skips preflight entirely, while every
+# axios/fetch call — geocoding and routing — dies with a bare
+# "TypeError: Failed to fetch". That looks like the gateway is down.
+#
+# Reflect the request header rather than answering unconditionally: Chrome only
+# enforces the promise for origins it asked about, and a hardcoded "true" would
+# tell every caller it may reach a private address.
+map $http_access_control_request_private_network $acrp_private {
+    default                  "";
+    "true"                   "true";
+}
+
+map $http_access_control_request_local_network $acrp_local {
+    default                  "";
+    "true"                   "true";
+}
+
 # Do not advertise the software. OSM's tile usage policy discourages heavy
 # automated use of public tile servers; keeping this generic is polite.
 server_tokens off;
@@ -98,8 +125,24 @@ server {
         return 200 "ok\n";
     }
 
+    # CORS preflight. A dedicated location, NOT an `if` in server scope:
+    # `add_header` is not permitted inside a server-level `if` block (nginx
+    # [emerg] "add_header directive is not allowed here"), and a server-level
+    # `if` would also run before location selection, so the preflight would be
+    # proxied to the backend and answered by Nominatim/OSRM instead of here.
+
     # Path form. The prefix is stripped so the backend sees a normal /tile/… path.
         location ~ ^/k/[0-9a-f]+(?<trest>/.*)$ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin  "*"                   always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS"  always;
+            add_header Access-Control-Allow-Headers "*"                   always;
+            add_header Access-Control-Max-Age       86400                 always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
+            add_header Vary                "Origin"                     always;
+            return 204;
+        }
             if ($osm_key_ok_path = 0) {
                 return 403 '{"error":"invalid or missing access key"}';
             }
@@ -108,6 +151,11 @@ server {
 
             rewrite ^ $trest break;
             proxy_pass http://tiles_up;
+            proxy_hide_header Access-Control-Allow-Origin;
+            proxy_hide_header Access-Control-Allow-Methods;
+            proxy_hide_header Access-Control-Allow-Headers;
+            proxy_hide_header Access-Control-Allow-Credentials;
+
 
             # Tiles are immutable per zoom level and a browser re-requests them on
             # every pan, so caching saves the renderer a lot of work.
@@ -116,28 +164,64 @@ server {
 
             # Leaflet on h-dashboard loads tiles from another origin.
             add_header Access-Control-Allow-Origin "*" always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
         }
 
         # Query form, no prefix to strip.
         location /tile/ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin  "*"                   always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS"  always;
+            add_header Access-Control-Allow-Headers "*"                   always;
+            add_header Access-Control-Max-Age       86400                 always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
+            add_header Vary                "Origin"                     always;
+            return 204;
+        }
             if ($osm_key_ok_query = 0) {
                 return 403 '{"error":"invalid or missing access key"}';
             }
 
             limit_req zone=tiles burst=60 nodelay;
             proxy_pass http://tiles_up;
+            proxy_hide_header Access-Control-Allow-Origin;
+            proxy_hide_header Access-Control-Allow-Methods;
+            proxy_hide_header Access-Control-Allow-Headers;
+            proxy_hide_header Access-Control-Allow-Credentials;
+
             expires 7d;
             add_header Cache-Control "public, max-age=604800";
             add_header Access-Control-Allow-Origin "*" always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
         }
 
         # Demo page from the tile image, for a quick manual check.
         location = / {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin  "*"                   always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS"  always;
+            add_header Access-Control-Allow-Headers "*"                   always;
+            add_header Access-Control-Max-Age       86400                 always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
+            add_header Vary                "Origin"                     always;
+            return 204;
+        }
             if ($osm_key_ok_query = 0) {
                 return 403 '{"error":"invalid or missing access key"}';
             }
             proxy_pass http://tiles_up;
+            proxy_hide_header Access-Control-Allow-Origin;
+            proxy_hide_header Access-Control-Allow-Methods;
+            proxy_hide_header Access-Control-Allow-Headers;
+            proxy_hide_header Access-Control-Allow-Credentials;
+
             add_header Access-Control-Allow-Origin "*" always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
         }
     }
 
@@ -146,8 +230,21 @@ server {
     listen 8088;
     server_name _;
 
+    # Same LNA/PNA preflight as the tile server — geocoding is an axios GET,
+    # so it is subject to preflight where an <img> tile is not.
+
     # Path form: /k/<key>/search?q=…  →  /search?q=…
     location ~ ^/k/[0-9a-f]+(?<grest>/.*)$ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin  "*"                   always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS"  always;
+            add_header Access-Control-Allow-Headers "*"                   always;
+            add_header Access-Control-Max-Age       86400                 always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
+            add_header Vary                "Origin"                     always;
+            return 204;
+        }
         if ($osm_key_ok_path = 0) {
             return 403 '{"error":"invalid or missing access key"}';
         }
@@ -157,6 +254,15 @@ server {
 
         rewrite ^ $grest break;
         proxy_pass http://nominatim_up;
+        # Nominatim and OSRM each emit their own Access-Control-Allow-Origin.
+        # Two ACAO headers on one response is a HARD CORS failure: the browser
+        # rejects the response even when both values are "*". Suppress the
+        # upstream copies so exactly one — the gateway's own — survives.
+        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Methods;
+        proxy_hide_header Access-Control-Allow-Headers;
+        proxy_hide_header Access-Control-Allow-Credentials;
+
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_set_header Host $host;
@@ -169,10 +275,22 @@ server {
         proxy_connect_timeout 10s;
 
         add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Private-Network $acrp_private always;
+        add_header Access-Control-Allow-Local-Network    $acrp_local  always;
     }
 
     # Query form.
     location / {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin  "*"                   always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS"  always;
+            add_header Access-Control-Allow-Headers "*"                   always;
+            add_header Access-Control-Max-Age       86400                 always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
+            add_header Vary                "Origin"                     always;
+            return 204;
+        }
         if ($osm_key_ok_query = 0) {
             return 403 '{"error":"invalid or missing access key"}';
         }
@@ -181,6 +299,15 @@ server {
         limit_req_status 429;
 
         proxy_pass http://nominatim_up;
+        # Nominatim and OSRM each emit their own Access-Control-Allow-Origin.
+        # Two ACAO headers on one response is a HARD CORS failure: the browser
+        # rejects the response even when both values are "*". Suppress the
+        # upstream copies so exactly one — the gateway's own — survives.
+        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Methods;
+        proxy_hide_header Access-Control-Allow-Headers;
+        proxy_hide_header Access-Control-Allow-Credentials;
+
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_set_header Host $host;
@@ -189,6 +316,8 @@ server {
         proxy_connect_timeout 10s;
 
         add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Private-Network $acrp_private always;
+        add_header Access-Control-Allow-Local-Network    $acrp_local  always;
     }
 }
 
@@ -197,8 +326,20 @@ server {
     listen 5000;
     server_name _;
 
+    # Same LNA/PNA preflight — leaflet-routing-machine issues a fetch.
+
     # Path form: /k/<key>/route/v1/driving/…  →  /route/v1/driving/…
     location ~ ^/k/[0-9a-f]+(?<rrest>/.*)$ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin  "*"                   always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS"  always;
+            add_header Access-Control-Allow-Headers "*"                   always;
+            add_header Access-Control-Max-Age       86400                 always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
+            add_header Vary                "Origin"                     always;
+            return 204;
+        }
         if ($osm_key_ok_path = 0) {
             return 403 '{"error":"invalid or missing access key"}';
         }
@@ -207,6 +348,15 @@ server {
 
         rewrite ^ $rrest break;
         proxy_pass http://osrm_up;
+        # Nominatim and OSRM each emit their own Access-Control-Allow-Origin.
+        # Two ACAO headers on one response is a HARD CORS failure: the browser
+        # rejects the response even when both values are "*". Suppress the
+        # upstream copies so exactly one — the gateway's own — survives.
+        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Methods;
+        proxy_hide_header Access-Control-Allow-Headers;
+        proxy_hide_header Access-Control-Allow-Credentials;
+
         proxy_http_version 1.1;
         proxy_set_header Connection "";
 
@@ -215,21 +365,44 @@ server {
         proxy_connect_timeout 10s;
 
         add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Private-Network $acrp_private always;
+        add_header Access-Control-Allow-Local-Network    $acrp_local  always;
     }
 
     # Query form.
     location / {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin  "*"                   always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS"  always;
+            add_header Access-Control-Allow-Headers "*"                   always;
+            add_header Access-Control-Max-Age       86400                 always;
+            add_header Access-Control-Allow-Private-Network $acrp_private always;
+            add_header Access-Control-Allow-Local-Network    $acrp_local  always;
+            add_header Vary                "Origin"                     always;
+            return 204;
+        }
         if ($osm_key_ok_query = 0) {
             return 403 '{"error":"invalid or missing access key"}';
         }
 
         limit_req zone=route burst=10 nodelay;
         proxy_pass http://osrm_up;
+        # Nominatim and OSRM each emit their own Access-Control-Allow-Origin.
+        # Two ACAO headers on one response is a HARD CORS failure: the browser
+        # rejects the response even when both values are "*". Suppress the
+        # upstream copies so exactly one — the gateway's own — survives.
+        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Methods;
+        proxy_hide_header Access-Control-Allow-Headers;
+        proxy_hide_header Access-Control-Allow-Credentials;
+
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_read_timeout 120s;
         proxy_connect_timeout 10s;
 
         add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Private-Network $acrp_private always;
+        add_header Access-Control-Allow-Local-Network    $acrp_local  always;
     }
 }
